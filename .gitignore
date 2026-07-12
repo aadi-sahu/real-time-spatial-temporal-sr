@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.vscode/
+*.onnx
+*.pth
+models/weights/
+*.png
+*.jpg
+outputs/
+.env
