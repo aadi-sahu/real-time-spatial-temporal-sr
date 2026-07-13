@@ -1,7 +1,10 @@
 """
-Milestone 9: Real-time pipeline combining live window capture with
+Milestone 9 (optimized): Real-time pipeline combining live window capture with
 GPU-accelerated Real-ESRGAN enhancement, displayed side-by-side with FPS.
-Configured for Undertale (native resolution 320x240).
+
+Optimizations added:
+- Skip AI inference on frames that haven't changed (static screens, dialogue, menus)
+- Downscale 4x model output to 2x for lighter downstream load
 """
 
 import ctypes
@@ -25,6 +28,8 @@ TITLE_BAR_HEIGHT = 32          # crop this many px off the top (title bar)
 NATIVE_WIDTH = 320             # game's native resolution, used before AI upscale
 NATIVE_HEIGHT = 240
 ONNX_MODEL_PATH = "models/onnx/anime_x4.onnx"
+FRAME_SKIP_THRESHOLD = 2.0     # lower = more sensitive to change, higher = skips more
+OUTPUT_SCALE = 2               # downscale model's native 4x output to this factor
 # ===================================================================
 
 
@@ -58,6 +63,12 @@ def postprocess(output: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(uint8_img, cv2.COLOR_RGB2BGR)
 
 
+def frames_are_similar(frame1: np.ndarray, frame2: np.ndarray, threshold: float) -> bool:
+    """Check if two frames are nearly identical (mean pixel difference below threshold)."""
+    diff = cv2.absdiff(frame1, frame2)
+    return diff.mean() < threshold
+
+
 class SharedState:
     def __init__(self):
         self.lock = threading.Lock()
@@ -65,6 +76,7 @@ class SharedState:
         self.enhanced_frame = None
         self.capture_fps = 0.0
         self.inference_fps = 0.0
+        self.frames_skipped = 0
         self.running = True
 
 
@@ -105,12 +117,14 @@ def capture_worker(state: SharedState, title_keyword: str, title_bar_height: int
 
 
 def inference_worker(state: SharedState, session: ort.InferenceSession,
-                      native_w: int, native_h: int) -> None:
+                      native_w: int, native_h: int, skip_threshold: float,
+                      output_scale: int) -> None:
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
 
     frame_count = 0
     start_time = time.time()
+    last_processed = None
 
     while state.running:
         try:
@@ -123,9 +137,26 @@ def inference_worker(state: SharedState, session: ort.InferenceSession,
 
             frame = cv2.resize(frame, (native_w, native_h), interpolation=cv2.INTER_AREA)
 
+            # Skip inference entirely if frame barely changed since last processed one
+            if last_processed is not None and frames_are_similar(frame, last_processed, skip_threshold):
+                with state.lock:
+                    state.frames_skipped += 1
+                time.sleep(0.02)
+                continue
+
+            last_processed = frame.copy()
+
             input_tensor = preprocess(frame)
             output = session.run([output_name], {input_name: input_tensor})[0]
             enhanced = postprocess(output)
+
+            # Model outputs native 4x; downscale to desired output_scale (lighter, still enhanced)
+            native_scale = 4
+            if output_scale != native_scale:
+                h, w = enhanced.shape[:2]
+                target_h = int(native_h * output_scale)
+                target_w = int(native_w * output_scale)
+                enhanced = cv2.resize(enhanced, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
             with state.lock:
                 state.enhanced_frame = enhanced
@@ -153,6 +184,7 @@ def display_loop(state: SharedState) -> None:
             enhanced = state.enhanced_frame.copy() if state.enhanced_frame is not None else None
             cap_fps = state.capture_fps
             inf_fps = state.inference_fps
+            skipped = state.frames_skipped
 
         if raw is None:
             time.sleep(0.05)
@@ -173,8 +205,8 @@ def display_loop(state: SharedState) -> None:
 
         cv2.putText(raw_resized, f"RAW  {cap_fps:.1f} FPS", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(enhanced_resized, f"AI ENHANCED  {inf_fps:.1f} FPS", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(enhanced_resized, f"AI ENHANCED  {inf_fps:.1f} FPS  (skipped: {skipped})", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         combined = np.hstack([raw_resized, enhanced_resized])
         cv2.imshow(window_name, combined)
@@ -198,11 +230,13 @@ if __name__ == "__main__":
         target=capture_worker, args=(state, WINDOW_TITLE_KEYWORD, TITLE_BAR_HEIGHT), daemon=True
     )
     inf_thread = threading.Thread(
-        target=inference_worker, args=(state, session, NATIVE_WIDTH, NATIVE_HEIGHT), daemon=True
+        target=inference_worker,
+        args=(state, session, NATIVE_WIDTH, NATIVE_HEIGHT, FRAME_SKIP_THRESHOLD, OUTPUT_SCALE),
+        daemon=True
     )
 
     cap_thread.start()
-    time.sleep(1)  # give capture a moment to lock onto the window before inference starts
+    time.sleep(1)
     inf_thread.start()
 
     display_loop(state)
